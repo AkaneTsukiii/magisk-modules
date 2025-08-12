@@ -1,77 +1,57 @@
 #!/bin/bash
-# Patch boot.img Android thành Arch Linux ARM (dùng abootimg, chạy trên Linux)
-# Author: ChatGPT
-# Yêu cầu: Ubuntu/Debian + boot.img gốc của máy
+# Script patch boot.img để boot vào Arch Linux ARM thay vì Android
+# Yêu cầu: Ubuntu/Debian, có sẵn boot.img, file Arch rootfs tar.gz
 
 set -e
 
 # ====== Cấu hình ======
-BOOT_IMG="boot.img" # boot.img gốc
-ARCH_URL="http://os.archlinuxarm.org/os/ArchLinuxARM-armv7-latest.tar.gz"
+BOOT_IMG="boot.img"                     # Đường dẫn tới boot.img gốc
+ARCH_ROOTFS="ArchLinuxARM-armv7.tar.gz"  # Rootfs Arch Linux ARM (tải từ archlinuxarm.org)
+WORKDIR="$(pwd)/patch_boot"
+RAMDISK_DIR="$WORKDIR/ramdisk"
+KERNEL_DIR="$WORKDIR/kernel"
+OUT_IMG="boot_patched.img"
 
-# ====== Kiểm tra file boot.img ======
-if [ ! -f "$BOOT_IMG" ]; then
-    echo "❌ Không tìm thấy $BOOT_IMG. Đặt file boot.img gốc vào cùng thư mục script."
-    exit 1
-fi
+# ====== Kiểm tra gói cần thiết ======
+sudo apt update
+sudo apt install -y abootimg bsdtar mkbootimg
 
-# ====== Cài công cụ cần thiết ======
-echo "📦 Cài công cụ..."
-sudo apt update -y
-sudo apt install -y abootimg cpio gzip wget
-
-# ====== Tạo thư mục làm việc ======
-WORKDIR="boot_unpack"
+# ====== Chuẩn bị thư mục ======
 rm -rf "$WORKDIR"
-mkdir "$WORKDIR"
-cd "$WORKDIR"
+mkdir -p "$RAMDISK_DIR" "$KERNEL_DIR"
 
-# ====== Giải nén boot.img ======
-echo "🔍 Giải nén boot.img..."
-abootimg -x "../$BOOT_IMG"
+echo "[*] Giải nén boot.img..."
+abootimg -x "$BOOT_IMG" -o "$WORKDIR"
 
-# ====== Giải nén ramdisk Android ======
-mkdir ramdisk
-cd ramdisk
-gzip -dc ../initrd.img | cpio -idmv
+echo "[*] Giải nén ramdisk..."
+mkdir "$RAMDISK_DIR/original"
+cd "$RAMDISK_DIR/original"
+gunzip -c "$WORKDIR"/initrd.img | cpio -id
 
-# ====== Xóa ramdisk cũ và thêm Arch ======
-echo "🗑 Xóa ramdisk Android..."
-rm -rf ./*
+# ====== Thay rootfs ======
+echo "[*] Xóa rootfs cũ và thay bằng Arch..."
+ROOT_MNT="$RAMDISK_DIR/original/root"
+sudo rm -rf "$ROOT_MNT"
+mkdir -p "$ROOT_MNT"
 
-echo "⬇️ Tải Arch Linux ARM..."
-wget -O arch.tar.gz "$ARCH_URL"
+# Giải nén Arch rootfs, bỏ qua cảnh báo xattr
+sudo bsdtar --no-xattrs -xpf "$ARCH_ROOTFS" -C "$ROOT_MNT"
 
-echo "📂 Giải nén Arch vào ramdisk..."
-mkdir -p mnt/root
-tar -xzf arch.tar.gz -C mnt/root
-rm arch.tar.gz
-
-# ====== Tạo init script ======
-cat > init <<'EOF'
-#!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sys /sys
-mount -t tmpfs tmpfs /tmp
-mount -o remount,rw /
-echo "Booting Arch Linux ARM..."
-exec switch_root /mnt/root /sbin/init
-EOF
-chmod +x init
+# ====== Chỉnh init script ======
+echo "[*] Chỉnh sửa init để mount rootfs..."
+INIT_FILE="$RAMDISK_DIR/original/init"
+sudo sed -i 's|/init.rc|/sbin/init|g' "$INIT_FILE"
 
 # ====== Đóng gói lại ramdisk ======
-echo "📦 Đóng gói ramdisk mới..."
-find . | cpio --create --format='newc' | gzip > ../initrd-new.img
-cd ..
+echo "[*] Đóng gói lại ramdisk..."
+cd "$RAMDISK_DIR/original"
+find . | cpio -o -H newc | gzip > "$WORKDIR/new_initrd.img"
 
-# ====== Đóng gói lại boot.img ======
-echo "📦 Đóng gói boot.img mới..."
-abootimg --create boot-arch.img -f bootimg.cfg -k zImage -r initrd-new.img
+# ====== Tạo boot.img mới ======
+echo "[*] Tạo boot.img mới..."
+mkbootimg --kernel "$WORKDIR/zImage" \
+          --ramdisk "$WORKDIR/new_initrd.img" \
+          --base 0x10000000 \
+          -o "$OUT_IMG"
 
-# ====== Xuất kết quả ======
-cd ..
-mkdir -p output
-cp "$WORKDIR/boot-arch.img" output/
-
-echo "✅ Hoàn tất! File output/boot-arch.img sẵn sàng để flash."
-echo "💡 Flash qua TWRP: Install → Install Image → Chọn boot-arch.img → Boot partition."
+echo "[+] Hoàn tất! File boot.img đã patch: $OUT_IMG"
